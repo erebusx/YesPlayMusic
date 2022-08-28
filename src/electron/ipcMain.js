@@ -88,10 +88,10 @@ function toBuffer(data) {
 }
 
 /**
- * Get the file URI from bilivideo.
+ * Get the file base64 data from bilivideo.
  *
  * @param {string} url The URL to fetch.
- * @returns {Promise<string>} The file URI.
+ * @returns {Promise<string>} The file base64 data.
  */
 async function getBiliVideoFile(url) {
   const axios = await import('axios').then(m => m.default);
@@ -106,7 +106,7 @@ async function getBiliVideoFile(url) {
   const buffer = toBuffer(response.data);
   const encodedData = buffer.toString('base64');
 
-  return `data:application/octet-stream;base64,${encodedData}`;
+  return encodedData;
 }
 
 /**
@@ -169,7 +169,7 @@ export function initIpcMain(win, store, trayEventEmitter) {
       const sourceList =
         typeof sourceListString === 'string'
           ? parseSourceStringToList(unmExecutor, sourceListString)
-          : ['migu', 'ytdl', 'bilibili', 'pyncm', 'kugou'];
+          : ['ytdl', 'bilibili', 'pyncm', 'kugou'];
       log(`[UNM] using source: ${sourceList.join(', ')}`);
       log(`[UNM] using configuration: ${JSON.stringify(context)}`);
 
@@ -222,9 +222,7 @@ export function initIpcMain(win, store, trayEventEmitter) {
   });
 
   ipcMain.on('maximizeOrUnmaximize', () => {
-    const isMaximized = win.isMaximized();
-    isMaximized ? win.unmaximize() : win.maximize();
-    win.webContents.send('isMaximized', isMaximized);
+    win.isMaximized() ? win.unmaximize() : win.maximize();
   });
 
   ipcMain.on('settings', (event, options) => {

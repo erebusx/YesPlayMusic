@@ -10,8 +10,18 @@ import { cacheTrackSource, getTrackSource } from '@/utils/db';
 import { isCreateMpris, isCreateTray } from '@/utils/platform';
 import { Howl, Howler } from 'howler';
 import shuffle from 'lodash/shuffle';
+import { decode as base642Buffer } from '@/utils/base64';
 
 const PLAY_PAUSE_FADE_DURATION = 200;
+
+/**
+ * @readonly
+ * @enum {string}
+ */
+const UNPLAYABLE_CONDITION = {
+  PLAY_NEXT_TRACK: 'playNextTrack',
+  PLAY_PREV_TRACK: 'playPrevTrack',
+};
 
 const electron =
   process.env.IS_ELECTRON === true ? window.require('electron') : null;
@@ -34,14 +44,14 @@ function setTitle(track) {
     ? `${track.name} · ${track.ar[0].name} - YesPlayMusic`
     : 'YesPlayMusic';
   if (isCreateTray) {
-    ipcRenderer.send('updateTrayTooltip', document.title);
+    ipcRenderer?.send('updateTrayTooltip', document.title);
   }
   store.commit('updateTitle', document.title);
 }
 
 function setTrayLikeState(isLiked) {
   if (isCreateTray) {
-    ipcRenderer.send('updateTrayLikeState', isLiked);
+    ipcRenderer?.send('updateTrayLikeState', isLiked);
   }
 }
 
@@ -163,6 +173,9 @@ export default class {
   get currentTrack() {
     return this._currentTrack;
   }
+  get currentTrackID() {
+    return this._currentTrack?.id ?? 0;
+  }
   get playlistSource() {
     return this._playlistSource;
   }
@@ -198,7 +211,7 @@ export default class {
 
     if (this._enabled) {
       // 恢复当前播放歌曲
-      this._replaceCurrentTrack(this._currentTrack.id, false).then(() => {
+      this._replaceCurrentTrack(this.currentTrackID, false).then(() => {
         this._howler?.seek(localStorage.getItem('playerCurrentTrackTime') ?? 0);
       }); // update audio source and init howler
       this._initMediaSession();
@@ -222,7 +235,7 @@ export default class {
   _setPlaying(isPlaying) {
     this._playing = isPlaying;
     if (isCreateTray) {
-      ipcRenderer.send('updateTrayPlayState', this._playing);
+      ipcRenderer?.send('updateTrayPlayState', this._playing);
     }
   }
   _setIntervals() {
@@ -234,7 +247,7 @@ export default class {
       this._progress = this._howler.seek();
       localStorage.setItem('playerCurrentTrackTime', this._progress);
       if (isCreateMpris) {
-        ipcRenderer.send('playerCurrentTrackTime', this._progress);
+        ipcRenderer?.send('playerCurrentTrackTime', this._progress);
       }
     }, 1000);
   }
@@ -277,7 +290,7 @@ export default class {
     // 返回 [trackID, index]
     return [this.list[next], next];
   }
-  async _shuffleTheList(firstTrackID = this._currentTrack.id) {
+  async _shuffleTheList(firstTrackID = this.currentTrackID) {
     let list = this._list.filter(tid => tid !== firstTrackID);
     if (firstTrackID === 'first') list = this._list;
     this._shuffledList = shuffle(list);
@@ -320,6 +333,25 @@ export default class {
         this._nextTrackCallback();
       },
     });
+    this._howler.on('loaderror', (_, errCode) => {
+      // https://developer.mozilla.org/en-US/docs/Web/API/MediaError/code
+      // code 3: MEDIA_ERR_DECODE
+      if (errCode === 3) {
+        this._playNextTrack(this._isPersonalFM);
+      } else {
+        const t = this.progress;
+        this._replaceCurrentTrackAudio(this.currentTrack, false, false).then(
+          replaced => {
+            // 如果 replaced 为 false，代表当前的 track 已经不是这里想要替换的track
+            // 此时则不修改当前的歌曲进度
+            if (replaced) {
+              this._howler?.seek(t);
+              this.play();
+            }
+          }
+        );
+      }
+    });
     if (autoplay) {
       this.play();
       if (this._currentTrack.name) {
@@ -329,25 +361,27 @@ export default class {
     }
     this.setOutputDevice();
   }
+  _getAudioSourceBlobURL(data) {
+    // Create a new object URL.
+    const source = URL.createObjectURL(new Blob([data]));
+
+    // Clean up the previous object URLs since we've created a new one.
+    // Revoke object URLs can release the memory taken by a Blob,
+    // which occupied a large proportion of memory.
+    for (const url in this.createdBlobRecords) {
+      URL.revokeObjectURL(url);
+    }
+
+    // Then, we replace the createBlobRecords with new one with
+    // our newly created object URL.
+    this.createdBlobRecords = [source];
+
+    return source;
+  }
   _getAudioSourceFromCache(id) {
     return getTrackSource(id).then(t => {
       if (!t) return null;
-
-      // Create a new object URL.
-      const source = URL.createObjectURL(new Blob([t.source]));
-
-      // Clean up the previous object URLs since we've created a new one.
-      // Revoke object URLs can release the memory taken by a Blob,
-      // which occupied a large proportion of memory.
-      for (const url in this.createdBlobRecords) {
-        URL.revokeObjectURL(url);
-      }
-
-      // Then, we replace the createBlobRecords with new one with
-      // our newly created object URL.
-      this.createdBlobRecords = [source];
-
-      return source;
+      return this._getAudioSourceBlobURL(t.source);
     });
   }
   _getAudioSourceFromNetease(track) {
@@ -416,15 +450,26 @@ export default class {
     );
 
     if (store.state.settings.automaticallyCacheSongs && retrieveSongInfo?.url) {
-      cacheTrackSource(
-        track,
-        retrieveSongInfo.url,
-        128000,
-        `unm:${retrieveSongInfo.source}`
-      );
+      // 对于来自 bilibili 的音源
+      // retrieveSongInfo.url 是音频数据的base64编码
+      // 其他音源为实际url
+      const url =
+        retrieveSongInfo.source === 'bilibili'
+          ? `data:application/octet-stream;base64,${retrieveSongInfo.url}`
+          : retrieveSongInfo.url;
+      cacheTrackSource(track, url, 128000, `unm:${retrieveSongInfo.source}`);
     }
 
-    return retrieveSongInfo?.url;
+    if (!retrieveSongInfo) {
+      return null;
+    }
+
+    if (retrieveSongInfo.source !== 'bilibili') {
+      return retrieveSongInfo.url;
+    }
+
+    const buffer = base642Buffer(retrieveSongInfo.url);
+    return this._getAudioSourceBlobURL(buffer);
   }
   _getAudioSource(track) {
     return this._getAudioSourceFromCache(String(track.id))
@@ -438,33 +483,61 @@ export default class {
   _replaceCurrentTrack(
     id,
     autoplay = true,
-    ifUnplayableThen = 'playNextTrack'
+    ifUnplayableThen = UNPLAYABLE_CONDITION.PLAY_NEXT_TRACK
   ) {
     if (autoplay && this._currentTrack.name) {
       this._scrobble(this.currentTrack, this._howler?.seek());
     }
     return getTrackDetail(id).then(data => {
-      let track = data.songs[0];
+      const track = data.songs[0];
       this._currentTrack = track;
       this._updateMediaSessionMetaData(track);
-      return this._getAudioSource(track).then(source => {
-        if (source) {
+      return this._replaceCurrentTrackAudio(
+        track,
+        autoplay,
+        true,
+        ifUnplayableThen
+      );
+    });
+  }
+  /**
+   * @returns 是否成功加载音频，并使用加载完成的音频替换了howler实例
+   */
+  _replaceCurrentTrackAudio(
+    track,
+    autoplay,
+    isCacheNextTrack,
+    ifUnplayableThen = UNPLAYABLE_CONDITION.PLAY_NEXT_TRACK
+  ) {
+    return this._getAudioSource(track).then(source => {
+      if (source) {
+        let replaced = false;
+        if (track.id === this.currentTrackID) {
           this._playAudioSource(source, autoplay);
-          this._cacheNextTrack();
-          return source;
-        } else {
-          store.dispatch('showToast', `无法播放 ${track.name}`);
-          if (ifUnplayableThen === 'playNextTrack') {
-            if (this.isPersonalFM) {
-              this.playNextFMTrack();
-            } else {
-              this.playNextTrack();
-            }
-          } else {
-            this.playPrevTrack();
-          }
+          replaced = true;
         }
-      });
+        if (isCacheNextTrack) {
+          this._cacheNextTrack();
+        }
+        return replaced;
+      } else {
+        store.dispatch('showToast', `无法播放 ${track.name}`);
+        switch (ifUnplayableThen) {
+          case UNPLAYABLE_CONDITION.PLAY_NEXT_TRACK:
+            this._playNextTrack(this.isPersonalFM);
+            break;
+          case UNPLAYABLE_CONDITION.PLAY_PREV_TRACK:
+            this.playPrevTrack();
+            break;
+          default:
+            store.dispatch(
+              'showToast',
+              `undefined Unplayable condition: ${ifUnplayableThen}`
+            );
+            break;
+        }
+        return false;
+      }
     });
   }
   _cacheNextTrack() {
@@ -497,11 +570,7 @@ export default class {
         this.playPrevTrack();
       });
       navigator.mediaSession.setActionHandler('nexttrack', () => {
-        if (this.isPersonalFM) {
-          this.playNextFMTrack();
-        } else {
-          this.playNextTrack();
-        }
+        this._playNextTrack(this.isPersonalFM);
       });
       navigator.mediaSession.setActionHandler('stop', () => {
         this.pause();
@@ -547,7 +616,7 @@ export default class {
 
     navigator.mediaSession.metadata = new window.MediaMetadata(metadata);
     if (isCreateMpris) {
-      ipcRenderer.send('metadata', metadata);
+      ipcRenderer?.send('metadata', metadata);
     }
   }
   _updateMediaSessionPositionState() {
@@ -565,11 +634,9 @@ export default class {
   _nextTrackCallback() {
     this._scrobble(this._currentTrack, 0, true);
     if (!this.isPersonalFM && this.repeatMode === 'one') {
-      this._replaceCurrentTrack(this._currentTrack.id);
-    } else if (this.isPersonalFM) {
-      this.playNextFMTrack();
+      this._replaceCurrentTrack(this.currentTrackID);
     } else {
-      this.playNextTrack();
+      this._playNextTrack(this.isPersonalFM);
     }
   }
   _loadPersonalFMNextTrack() {
@@ -603,7 +670,7 @@ export default class {
     }
     let copyTrack = { ...track };
     copyTrack.dt -= seekTime * 1000;
-    ipcRenderer.send('playDiscordPresence', copyTrack);
+    ipcRenderer?.send('playDiscordPresence', copyTrack);
   }
   _pauseDiscordPresence(track) {
     if (
@@ -612,13 +679,16 @@ export default class {
     ) {
       return null;
     }
-    ipcRenderer.send('pauseDiscordPresence', track);
+    ipcRenderer?.send('pauseDiscordPresence', track);
+  }
+  _playNextTrack(isPersonal) {
+    if (isPersonal) {
+      this.playNextFMTrack();
+    } else {
+      this.playNextTrack();
+    }
   }
 
-  currentTrackID() {
-    const { list, current } = this._getListAndCurrent();
-    return list[current];
-  }
   appendTrack(trackID) {
     this.list.append(trackID);
   }
@@ -683,7 +753,11 @@ export default class {
     const [trackID, index] = this._getPrevTrack();
     if (trackID === undefined) return false;
     this.current = index;
-    this._replaceCurrentTrack(trackID, true, 'playPrevTrack');
+    this._replaceCurrentTrack(
+      trackID,
+      true,
+      UNPLAYABLE_CONDITION.PLAY_PREV_TRACK
+    );
     return true;
   }
   saveSelfToLocalStorage() {
@@ -824,20 +898,14 @@ export default class {
   addTrackToPlayNext(trackID, playNow = false) {
     this._playNextList.push(trackID);
     if (playNow) {
-      if (this.isPersonalFM) {
-        this.playNextFMTrack();
-      } else {
-        this.playNextTrack();
-      }
+      this.playNextTrack();
     }
   }
   playPersonalFM() {
     this._isPersonalFM = true;
     if (!this._enabled) this._enabled = true;
-    if (this._currentTrack.id !== this._personalFMTrack.id) {
-      this._replaceCurrentTrack(this._personalFMTrack.id).then(() =>
-        this.playOrPause()
-      );
+    if (this.currentTrackID !== this._personalFMTrack.id) {
+      this._replaceCurrentTrack(this._personalFMTrack.id, true);
     } else {
       this.playOrPause();
     }
@@ -853,7 +921,7 @@ export default class {
   sendSelfToIpcMain() {
     if (process.env.IS_ELECTRON !== true) return false;
     let liked = store.state.liked.songs.includes(this.currentTrack.id);
-    ipcRenderer.send('player', {
+    ipcRenderer?.send('player', {
       playing: this.playing,
       likedCurrentTrack: liked,
     });
@@ -869,13 +937,13 @@ export default class {
       this.repeatMode = 'on';
     }
     if (isCreateMpris) {
-      ipcRenderer.send('switchRepeatMode', this.repeatMode);
+      ipcRenderer?.send('switchRepeatMode', this.repeatMode);
     }
   }
   switchShuffle() {
     this.shuffle = !this.shuffle;
     if (isCreateMpris) {
-      ipcRenderer.send('switchShuffle', this.shuffle);
+      ipcRenderer?.send('switchShuffle', this.shuffle);
     }
   }
   switchReversed() {
